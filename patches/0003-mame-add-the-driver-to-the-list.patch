@@ -1,0 +1,11 @@
+diff --git a/src/mame/mame.lst b/src/mame/mame.lst
+index b0d5c4e4..d29151b0 100644
+--- a/src/mame/mame.lst
++++ b/src/mame/mame.lst
+@@ -50045,3 +50045,6 @@ iq151
+ 
+ @source:zvt/pp01.cpp
+ pp01
++
++@source:dec/noname.cpp
++noname

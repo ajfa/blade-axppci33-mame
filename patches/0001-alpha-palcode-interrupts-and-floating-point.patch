@@ -1,0 +1,964 @@
+diff --git a/src/devices/cpu/alpha/alpha.cpp b/src/devices/cpu/alpha/alpha.cpp
+index 62752d5f..6258b91f 100644
+--- a/src/devices/cpu/alpha/alpha.cpp
++++ b/src/devices/cpu/alpha/alpha.cpp
+@@ -28,6 +28,7 @@
+ 
+ #include "softfloat3/source/include/softfloat.h"
+ 
++
+ #define LOG_EXCEPTION (1U << 1)
+ #define LOG_SYSCALLS  (1U << 2)
+ 
+@@ -35,6 +36,64 @@
+ 
+ #include "logmacro.h"
+ 
++namespace {
++
++constexpr u64 FP_SIGN     = 0x80000000'00000000ULL;
++constexpr u64 FP_SIGN_EXP = 0xfff00000'00000000ULL;
++constexpr u64 FP_TRUE     = 0x40000000'00000000ULL;
++
++// single precision operands are held in registers in double precision format
++float32_t narrow(u64 const data)
++{
++	return f64_to_f32(float64_t{ data });
++}
++
++u64 widen(float32_t const data)
++{
++	return f32_to_f64(data).v;
++}
++
++bool is_nan(u64 const data)
++{
++	return ((data & 0x7ff00000'00000000ULL) == 0x7ff00000'00000000ULL)
++		&& (data & 0x000fffff'ffffffffULL);
++}
++
++u64 compare(bool const result)
++{
++	return result ? FP_TRUE : 0;
++}
++
++u8 rounding(unsigned const mode, u64 const fpcr)
++{
++	// mode 3 takes the rounding from the control register
++	unsigned const selected = (mode == 3) ? unsigned((fpcr >> 58) & 3) : mode;
++
++	switch (selected)
++	{
++	case 0:  return softfloat_round_minMag;
++	case 1:  return softfloat_round_min;
++	case 2:  return softfloat_round_near_even;
++	default: return softfloat_round_max;
++	}
++}
++
++}
++
++/*
++ * The high half of an unaligned pair shifts by 64 when the byte offset is
++ * zero, which C++ leaves undefined and the architecture defines as zero.
++ */
++u64 shift_high_left(u64 data, unsigned byte_loc)
++{
++	return byte_loc ? (data << (64 - byte_loc * 8)) : 0;
++}
++
++u64 shift_high_right(u64 data, unsigned byte_loc)
++{
++	return byte_loc ? (data >> (64 - byte_loc * 8)) : 0;
++}
++
+ DEFINE_DEVICE_TYPE(DEC_21064, dec_21064_device, "21064", "DEC Alpha 21064")
+ 
+ dec_21064_device::dec_21064_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock)
+@@ -70,6 +129,7 @@ void alpha_device::device_start()
+ 	save_item(NAME(m_pc));
+ 	save_item(NAME(m_r));
+ 	save_item(NAME(m_f));
++	save_item(NAME(m_fpcr));
+ 
+ 	save_item(NAME(m_pal_mode));
+ 
+@@ -91,17 +151,24 @@ void alpha_device::device_reset()
+ {
+ 	m_pc = 0;
+ 	m_pal_mode = true;
++	m_hw_access = false;
+ }
+ 
+ void alpha_device::execute_run()
+ {
+ 	while (m_icount > 0)
+ 	{
++		m_pc_insn = m_pc;
++
++		interrupt_check();
++
+ 		debugger_instruction_hook(m_pc);
+ 
+ 		fetch(m_pc,
+ 			[this](u32 const op)
+ 			{
++				m_insn = op;
++
+ 				// update the program counter
+ 				m_pc += 4;
+ 
+@@ -215,7 +282,7 @@ void alpha_device::cpu_execute(u32 const op)
+ 			{
+ 				u8 temp = 0;
+ 				for (unsigned i = 0; i < 8; i++)
+-					if (u8(m_r[Ra(op)] >> (i * 8)) >= u8(Im(op)))
++					if (u8(m_r[Ra(op)] >> (i * 8)) >= u8(Im(op) >> (i * 8)))
+ 						temp |= (1U << i);
+ 
+ 				m_r[Rc(op)] = u64(temp);
+@@ -349,14 +416,14 @@ void alpha_device::cpu_execute(u32 const op)
+ 		case 0x3b: m_r[Rc(op)] = (m_r[Ra(op)] << ((m_r[Rb(op)] & 7) * 8)) & zap_mask(~(u8(0xff) << (m_r[Rb(op)] & 7))); break; // insql
+ 		case 0x3c: m_r[Rc(op)] = s64(m_r[Ra(op)]) >> (m_r[Rb(op)] & 63); break; // sra
+ 		case 0x52: m_r[Rc(op)] = m_r[Ra(op)] & zap_mask(u8(0x03) >> (8 - (m_r[Rb(op)] & 7))); break; // mskwh
+-		case 0x57: m_r[Rc(op)] = (m_r[Ra(op)] >> (64 - ((m_r[Rb(op)] & 7) * 8))) & zap_mask(~(u8(0x03) >> (8 - (m_r[Rb(op)] & 7)))); break; // inswh
+-		case 0x5a: m_r[Rc(op)] = (m_r[Ra(op)] << (64 - ((m_r[Rb(op)] & 7) * 8))) & zap_mask(~u8(0x03)); break; // extwh
++		case 0x57: m_r[Rc(op)] = shift_high_right(m_r[Ra(op)], m_r[Rb(op)] & 7) & zap_mask(~(u8(0x03) >> (8 - (m_r[Rb(op)] & 7)))); break; // inswh
++		case 0x5a: m_r[Rc(op)] = shift_high_left(m_r[Ra(op)], m_r[Rb(op)] & 7) & zap_mask(~u8(0x03)); break; // extwh
+ 		case 0x62: m_r[Rc(op)] = m_r[Ra(op)] & zap_mask(u8(0x0f) >> (8 - (m_r[Rb(op)] & 7))); break; // msklh
+-		case 0x67: m_r[Rc(op)] = (m_r[Ra(op)] >> (64 - ((m_r[Rb(op)] & 7) * 8))) & zap_mask(~(u8(0x0f) >> (8 - (m_r[Rb(op)] & 7)))); break; // inslh
+-		case 0x6a: m_r[Rc(op)] = (m_r[Ra(op)] << (64 - ((m_r[Rb(op)] & 7) * 8))) & zap_mask(~u8(0x0f)); break; // extlh
++		case 0x67: m_r[Rc(op)] = shift_high_right(m_r[Ra(op)], m_r[Rb(op)] & 7) & zap_mask(~(u8(0x0f) >> (8 - (m_r[Rb(op)] & 7)))); break; // inslh
++		case 0x6a: m_r[Rc(op)] = shift_high_left(m_r[Ra(op)], m_r[Rb(op)] & 7) & zap_mask(~u8(0x0f)); break; // extlh
+ 		case 0x72: m_r[Rc(op)] = m_r[Ra(op)] & zap_mask(u8(0xff) >> (8 - (m_r[Rb(op)] & 7))); break; // mskqh
+-		case 0x77: m_r[Rc(op)] = (m_r[Ra(op)] >> (64 - ((m_r[Rb(op)] & 7) * 8))) & zap_mask(~(u8(0xff) >> (8 - (m_r[Rb(op)] & 7)))); break; // insqh
+-		case 0x7a: m_r[Rc(op)] = (m_r[Ra(op)] << (64 - ((m_r[Rb(op)] & 7) * 8))) & zap_mask(u8(~u8(0xff))); break; // extqh
++		case 0x77: m_r[Rc(op)] = shift_high_right(m_r[Ra(op)], m_r[Rb(op)] & 7) & zap_mask(~(u8(0xff) >> (8 - (m_r[Rb(op)] & 7)))); break; // insqh
++		case 0x7a: m_r[Rc(op)] = shift_high_left(m_r[Ra(op)], m_r[Rb(op)] & 7) & zap_mask(u8(~u8(0xff))); break; // extqh
+ 
+ 			// immediate variants
+ 		case 0x82: m_r[Rc(op)] = m_r[Ra(op)] & zap_mask(u8(0x01) << (Im(op) & 7)); break; // mskbl
+@@ -377,14 +444,14 @@ void alpha_device::cpu_execute(u32 const op)
+ 		case 0xbb: m_r[Rc(op)] = (m_r[Ra(op)] << ((Im(op) & 7) * 8)) & zap_mask(~(u8(0xff) << (Im(op) & 7))); break; // insql
+ 		case 0xbc: m_r[Rc(op)] = s64(m_r[Ra(op)]) >> (Im(op) & 63); break; // sra
+ 		case 0xd2: m_r[Rc(op)] = m_r[Ra(op)] & zap_mask(u8(0x03) >> (8 - (Im(op) & 7))); break; // mskwh
+-		case 0xd7: m_r[Rc(op)] = (m_r[Ra(op)] >> (64 - ((Im(op) & 7) * 8))) & zap_mask(~(u8(0x03) >> (8 - (Im(op) & 7)))); break; // inswh
+-		case 0xda: m_r[Rc(op)] = (m_r[Ra(op)] << (64 - ((Im(op) & 7) * 8))) & zap_mask(~u8(0x03)); break; // extwh
++		case 0xd7: m_r[Rc(op)] = shift_high_right(m_r[Ra(op)], Im(op) & 7) & zap_mask(~(u8(0x03) >> (8 - (Im(op) & 7)))); break; // inswh
++		case 0xda: m_r[Rc(op)] = shift_high_left(m_r[Ra(op)], Im(op) & 7) & zap_mask(~u8(0x03)); break; // extwh
+ 		case 0xe2: m_r[Rc(op)] = m_r[Ra(op)] & zap_mask(u8(0x0f) >> (8 - (Im(op) & 7))); break; // msklh
+-		case 0xe7: m_r[Rc(op)] = (m_r[Ra(op)] >> (64 - ((Im(op) & 7) * 8))) & zap_mask(~(u8(0x0f) >> (8 - (Im(op) & 7)))); break; // inslh
+-		case 0xea: m_r[Rc(op)] = (m_r[Ra(op)] << (64 - ((Im(op) & 7) * 8))) & zap_mask(~u8(0x0f)); break; // extlh
++		case 0xe7: m_r[Rc(op)] = shift_high_right(m_r[Ra(op)], Im(op) & 7) & zap_mask(~(u8(0x0f) >> (8 - (Im(op) & 7)))); break; // inslh
++		case 0xea: m_r[Rc(op)] = shift_high_left(m_r[Ra(op)], Im(op) & 7) & zap_mask(~u8(0x0f)); break; // extlh
+ 		case 0xf2: m_r[Rc(op)] = m_r[Ra(op)] & zap_mask(u8(0xff) >> (8 - (Im(op) & 7))); break; // mskqh
+-		case 0xf7: m_r[Rc(op)] = (m_r[Ra(op)] >> (64 - ((Im(op) & 7) * 8))) & zap_mask(~(u8(0xff) >> (8 - (Im(op) & 7)))); break; // insqh
+-		case 0xfa: m_r[Rc(op)] = (m_r[Ra(op)] << (64 - ((Im(op) & 7) * 8))) & zap_mask(u8(~u8(0xff))); break; // extqh
++		case 0xf7: m_r[Rc(op)] = shift_high_right(m_r[Ra(op)], Im(op) & 7) & zap_mask(~(u8(0xff) >> (8 - (Im(op) & 7)))); break; // insqh
++		case 0xfa: m_r[Rc(op)] = shift_high_left(m_r[Ra(op)], Im(op) & 7) & zap_mask(u8(~u8(0xff))); break; // extqh
+ 		}
+ 		break;
+ 	case 0x13: // INTM* (integer multiply)
+@@ -407,8 +474,89 @@ void alpha_device::cpu_execute(u32 const op)
+ 		break;
+ 	//case 0x14: // ITFP* (integer to floating)
+ 	//case 0x15: // FLTV* (vax floating)
+-	//case 0x16: // FLTI* (ieee floating)
+-	//case 0x17: // FLTL* (floating)
++	case 0x16: // FLTI* (ieee floating)
++		{
++			/*
++			 * The function field holds the trapping mode in bits 10 to 8 and
++			 * the rounding mode in bits 7 and 6; what is left identifies the
++			 * operation and the format of its operands.
++			 */
++			unsigned const fn = (op >> 5) & 0x7ff;
++			float64_t const fa{ m_f[Ra(op)] };
++			float64_t const fb{ m_f[Rb(op)] };
++
++			softfloat_roundingMode = rounding((fn >> 6) & 3, m_fpcr);
++
++			switch (fn & 0x3f)
++			{
++			case 0x00: m_f[Rc(op)] = widen(f32_add(narrow(fa.v), narrow(fb.v))); break; // adds
++			case 0x01: m_f[Rc(op)] = widen(f32_sub(narrow(fa.v), narrow(fb.v))); break; // subs
++			case 0x02: m_f[Rc(op)] = widen(f32_mul(narrow(fa.v), narrow(fb.v))); break; // muls
++			case 0x03: m_f[Rc(op)] = widen(f32_div(narrow(fa.v), narrow(fb.v))); break; // divs
++			case 0x0b: m_f[Rc(op)] = widen(f32_sqrt(narrow(fb.v))); break; // sqrts
++
++			case 0x20: m_f[Rc(op)] = f64_add(fa, fb).v; break; // addt
++			case 0x21: m_f[Rc(op)] = f64_sub(fa, fb).v; break; // subt
++			case 0x22: m_f[Rc(op)] = f64_mul(fa, fb).v; break; // mult
++			case 0x23: m_f[Rc(op)] = f64_div(fa, fb).v; break; // divt
++			case 0x2b: m_f[Rc(op)] = f64_sqrt(fb).v; break; // sqrtt
++
++			case 0x24: m_f[Rc(op)] = compare(is_nan(fa.v) || is_nan(fb.v)); break; // cmptun
++			case 0x25: m_f[Rc(op)] = compare(f64_eq(fa, fb)); break; // cmpteq
++			case 0x26: m_f[Rc(op)] = compare(f64_lt(fa, fb)); break; // cmptlt
++			case 0x27: m_f[Rc(op)] = compare(f64_le(fa, fb)); break; // cmptle
++
++			case 0x2c: m_f[Rc(op)] = widen(f64_to_f32(fb)); break; // cvtts
++			case 0x2f: m_f[Rc(op)] = u64(f64_to_i64(fb, softfloat_roundingMode, false)); break; // cvttq
++			case 0x3c: m_f[Rc(op)] = widen(i64_to_f32(s64(m_f[Rb(op)]))); break; // cvtqs
++			case 0x3e: m_f[Rc(op)] = i64_to_f64(s64(m_f[Rb(op)])).v; break; // cvtqt
++
++			default:
++				logerror("unhandled ieee function 0x%03x (%s)\n", fn, machine().describe_context());
++				break;
++			}
++
++			softfloat_roundingMode = softfloat_round_near_even;
++		}
++		break;
++
++	case 0x17: // FLTL* (floating)
++		{
++			unsigned const fn = (op >> 5) & 0x7ff;
++			u64 const fa = m_f[Ra(op)];
++			u64 const fb = m_f[Rb(op)];
++
++			switch (fn & 0x3f)
++			{
++			case 0x10: // cvtlq
++				m_f[Rc(op)] = s64(s32((((fb >> 62) & 3) << 30) | ((fb >> 29) & 0x3fffffff)));
++				break;
++
++			case 0x20: m_f[Rc(op)] = (fa & FP_SIGN) | (fb & ~FP_SIGN); break; // cpys
++			case 0x21: m_f[Rc(op)] = (~fa & FP_SIGN) | (fb & ~FP_SIGN); break; // cpysn
++			case 0x22: m_f[Rc(op)] = (fa & FP_SIGN_EXP) | (fb & ~FP_SIGN_EXP); break; // cpyse
++
++			case 0x24: m_fpcr = fa; break; // mt_fpcr
++			case 0x25: m_f[Ra(op)] = m_fpcr; break; // mf_fpcr
++
++			case 0x2a: if (!(fa & ~FP_SIGN)) m_f[Rc(op)] = fb; break; // fcmoveq
++			case 0x2b: if (fa & ~FP_SIGN) m_f[Rc(op)] = fb; break; // fcmovne
++			case 0x2c: if ((fa & FP_SIGN) && (fa & ~FP_SIGN)) m_f[Rc(op)] = fb; break; // fcmovlt
++			case 0x2d: if (!(fa & FP_SIGN) || !(fa & ~FP_SIGN)) m_f[Rc(op)] = fb; break; // fcmovge
++			case 0x2e: if ((fa & FP_SIGN) || !(fa & ~FP_SIGN)) m_f[Rc(op)] = fb; break; // fcmovle
++			case 0x2f: if (!(fa & FP_SIGN) && (fa & ~FP_SIGN)) m_f[Rc(op)] = fb; break; // fcmovgt
++
++			case 0x30: // cvtql
++				m_f[Rc(op)] = (((fb >> 30) & 3) << 62) | ((fb & 0x3fffffff) << 29);
++				break;
++
++			default:
++				logerror("unhandled floating function 0x%03x (%s)\n", fn, machine().describe_context());
++				break;
++			}
++		}
++		break;
++
+ 
+ 	case 0x18: // MISC* (miscellaneous)
+ 		// TODO: all of these are effectively no-ops for now
+@@ -420,7 +568,9 @@ void alpha_device::cpu_execute(u32 const op)
+ 		case 0x4400: break; // wmb
+ 		case 0x8000: break; // fetch
+ 		case 0xa000: break; // fetch_m
+-		case 0xc000: break; // rpcc
++		case 0xc000: // rpcc
++			m_r[Ra(op)] = u32(total_cycles());
++			break;
+ 		case 0xe000: break; // rc
+ 		case 0xe800: break; // ecb
+ 		case 0xf000: break; // rs
+@@ -447,61 +597,43 @@ void alpha_device::cpu_execute(u32 const op)
+ 		load_l<u32>(m_r[Rb(op)] + Disp_M(op),
+ 			[this, op](address_space &space, u64 address, s32 data)
+ 			{
+-				if (m_lock_watch)
+-					m_lock_watch->remove();
+-
+ 				m_r[Ra(op)] = s64(data);
+ 
+-				space.install_write_tap(offs_t(address & ~15), offs_t(address | 15), "ldl_l",
+-					[this](offs_t offset, u64 &data, u64 mem_mask)
+-					{
+-						m_lock_watch->remove();
+-						m_lock_watch = nullptr;
+-					});
++				m_lock_address = address & ~15;
++				m_lock_flag = true;
+ 			});
+ 		break;
+ 	case 0x2b: // ldq_l
+ 		load_l<u64>(m_r[Rb(op)] + Disp_M(op),
+ 			[this, op](address_space &space, u64 address, u64 data)
+ 			{
+-				if (m_lock_watch)
+-					m_lock_watch->remove();
+-
+ 				m_r[Ra(op)] = data;
+ 
+-				space.install_write_tap(offs_t(address & ~15), offs_t(address | 15), "ldq_l",
+-					[this](offs_t offset, u64 &data, u64 mem_mask)
+-					{
+-						m_lock_watch->remove();
+-						m_lock_watch = nullptr;
+-					});
++				m_lock_address = address & ~15;
++				m_lock_flag = true;
+ 			});
+ 		break;
+ 	case 0x2c: store<u32>(m_r[Rb(op)] + Disp_M(op), u32(m_r[Ra(op)])); break; // stl
+ 	case 0x2d: store<u64>(m_r[Rb(op)] + Disp_M(op), m_r[Ra(op)]); break; // stq
+ 	case 0x2e: // stl_c
+-		if (m_lock_watch)
++		if (!m_lock_flag)
++			m_r[Ra(op)] = 0;
++		else if (store<u32>(m_r[Rb(op)] + Disp_M(op), u32(m_r[Ra(op)])))
+ 		{
+-			store<u32>(m_r[Rb(op)] + Disp_M(op), u32(m_r[Ra(op)]));
++			// the source register is also the result, so it can only be
++			// written once the store is known to have happened
+ 			m_r[Ra(op)] = 1;
+-
+-			m_lock_watch->remove();
+-			m_lock_watch = nullptr;
++			m_lock_flag = false;
+ 		}
+-		else
+-			m_r[Ra(op)] = 0;
+ 		break;
+ 	case 0x2f: // stq_c
+-		if (m_lock_watch)
++		if (!m_lock_flag)
++			m_r[Ra(op)] = 0;
++		else if (store<u64>(m_r[Rb(op)] + Disp_M(op), m_r[Ra(op)]))
+ 		{
+-			store<u64>(m_r[Rb(op)] + Disp_M(op), m_r[Ra(op)]);
+ 			m_r[Ra(op)] = 1;
+-
+-			m_lock_watch->remove();
+-			m_lock_watch = nullptr;
++			m_lock_flag = false;
+ 		}
+-		else
+-			m_r[Ra(op)] = 0;
+ 		break;
+ 
+ 		// branch format
+@@ -618,6 +750,90 @@ u64 alpha_device::u64_to_g_floating(u64 const data)
+ 		((data & 0xffff0000'00000000ULL) >> 48);
+ }
+ 
++/*
++ * Pages are 8K and the palcode services translation buffer misses: on a miss the
++ * access is abandoned, the faulting address is recorded and the appropriate
++ * palcode entry is taken. The handler writes the tag and pte and returns with
++ * hw_rei, which retries the access.
++ */
++bool alpha_ev4_device::tb_translate(tb_entry *tb, unsigned count, u64 &address, int intention, u64 &fault)
++{
++	u64 const vpn = address >> 13;
++	bool const user = m_ibx[IBX_PS] & IBX_PS_R_CM;
++	bool const write = (intention == device_memory_interface::TR_WRITE);
++
++	fault = 0;
++
++	for (unsigned i = 0; i < count; i++)
++		if (tb[i].valid && (tb[i].tag >> 13) == vpn)
++		{
++			u64 const pte = tb[i].pte;
++
++			// access violation takes precedence over the fault-on bits
++			u64 const enable = write
++				? (user ? PTE_UWE : PTE_KWE)
++				: (user ? PTE_URE : PTE_KRE);
++
++			if (!(pte & enable))
++				fault = MM_CSR_ACV;
++			else if (write && (pte & PTE_FOW))
++				fault = MM_CSR_FOW;
++			else if (!write && (pte & PTE_FOR))
++				fault = MM_CSR_FOR;
++
++			if (fault)
++				return false;
++
++			address = ((pte >> 32) << 13) | (address & 0x1fff);
++
++			return true;
++		}
++
++	return false;
++}
++
++void alpha_ev4_device::tb_load(tb_entry *tb, unsigned count, unsigned &next, u64 pte)
++{
++	// an invalid pte just displaces the entry
++	tb[next].tag = m_tb_tag;
++	tb[next].pte = pte;
++	tb[next].valid = BIT(pte, 0);
++
++	next = (next + 1) % count;
++}
++
++void alpha_ev4_device::exception(u16 entry)
++{
++	m_lock_flag = false;
++
++	m_ibx[IBX_EXC_ADDR] = m_pc_insn;
++	if (m_pal_mode)
++		m_ibx[IBX_EXC_ADDR] |= 1;
++
++	m_pal_mode = true;
++	m_pc = m_ibx[IBX_PAL_BASE] | entry;
++}
++
++/*
++ * Longword and quadword references must be naturally aligned; the operating
++ * system emulates the ones that are not, so hand it the address, the opcode
++ * and the target register the same way a data fault does.
++ */
++bool alpha_ev4_device::unaligned(u64 address, unsigned bytes, int intention)
++{
++	if (!(address & (bytes - 1)))
++		return false;
++
++	m_abx[ABX_VA] = address & 0x7ff'ffffffff;
++	m_abx[ABX_MM_CSR] = (intention == device_memory_interface::TR_WRITE ? MM_CSR_WR : 0)
++		| (u64(m_insn >> 26) << MM_CSR_V_OPC)
++		| (u64((m_insn >> 21) & 0x1f) << MM_CSR_V_RA);
++
++	exception(UNALIGN);
++
++	return true;
++}
++
+ bool alpha_ev4_device::cpu_translate(u64 &address, int intention)
+ {
+ 	// trim virtual address to 43 bits
+@@ -625,6 +841,14 @@ bool alpha_ev4_device::cpu_translate(u64 &address, int intention)
+ 
+ 	if (intention == device_memory_interface::TR_FETCH)
+ 	{
++		// palcode runs untranslated
++		if (m_pal_mode)
++		{
++			address &= 0x3'ffffffff;
++
++			return true;
++		}
++
+ 		// instruction superpage mapping
+ 		if ((m_ibx[IBX_ICCSR] & IBX_ICCSR_R_MAP) && !(m_ibx[IBX_PS] & IBX_PS_R_CM) && (address >> 41) == 2)
+ 		{
+@@ -632,6 +856,25 @@ bool alpha_ev4_device::cpu_translate(u64 &address, int intention)
+ 
+ 			return true;
+ 		}
++
++		u64 fault = 0;
++		if (tb_translate(m_itb, std::size(m_itb), address, intention, fault))
++			return true;
++
++		if (fault)
++		{
++			m_abx[ABX_VA] = address;
++			m_abx[ABX_MM_CSR] = fault;
++
++			exception(fault == MM_CSR_ACV ? ITB_ACV : D_FAULT);
++
++			return false;
++		}
++
++
++		exception(ITB_MISS);
++
++		return false;
+ 	}
+ 	else
+ 	{
+@@ -650,14 +893,42 @@ bool alpha_ev4_device::cpu_translate(u64 &address, int intention)
+ 
+ 			return true;
+ 		}
+-	}
+ 
+-	return true;
++		u64 fault = 0;
++		if (tb_translate(m_dtb, std::size(m_dtb), address, intention, fault))
++			return true;
++
++		if (fault)
++		{
++			m_abx[ABX_VA] = address;
++			m_abx[ABX_MM_CSR] = fault
++				| (intention == device_memory_interface::TR_WRITE ? MM_CSR_WR : 0)
++				| (u64(m_insn >> 26) << MM_CSR_V_OPC)
++				| (u64((m_insn >> 21) & 0x1f) << MM_CSR_V_RA);
++
++			exception(D_FAULT);
++
++			return false;
++		}
++
++		m_abx[ABX_VA] = address;
++		m_abx[ABX_MM_CSR] = (intention == device_memory_interface::TR_WRITE ? MM_CSR_WR : 0)
++			| (u64(m_insn >> 26) << MM_CSR_V_OPC)
++			| (u64((m_insn >> 21) & 0x1f) << MM_CSR_V_RA);
++
++		exception(m_pal_mode ? DTB_MISS_PAL : DTB_MISS_NATIVE);
++
++		return false;
++	}
+ }
+ 
+ template <typename T, typename U> std::enable_if_t<std::is_convertible<U, std::function<void(T)>>::value, void> alpha_device::load(u64 address, U &&apply)
+ {
+-	cpu_translate(address, device_memory_interface::TR_READ);
++	if (sizeof(T) > 2 && unaligned(address, sizeof(T), device_memory_interface::TR_READ))
++		return;
++
++	if (!cpu_translate(address, device_memory_interface::TR_READ))
++		return;
+ 
+ 	unsigned const s = (address >> 31) & 6;
+ 
+@@ -672,7 +943,11 @@ template <typename T, typename U> std::enable_if_t<std::is_convertible<U, std::f
+ 
+ template <typename T, typename U> std::enable_if_t<std::is_convertible<U, std::function<void(address_space &, u64, T)>>::value, void> alpha_device::load_l(u64 address, U &&apply)
+ {
+-	cpu_translate(address, device_memory_interface::TR_READ);
++	if (unaligned(address, sizeof(T), device_memory_interface::TR_READ))
++		return;
++
++	if (!cpu_translate(address, device_memory_interface::TR_READ))
++		return;
+ 
+ 	unsigned const s = (address >> 31) & 6;
+ 
+@@ -683,9 +958,13 @@ template <typename T, typename U> std::enable_if_t<std::is_convertible<U, std::f
+ 	}
+ }
+ 
+-template <typename T, typename U> std::enable_if_t<std::is_convertible<U, T>::value, void> alpha_device::store(u64 address, U data, T mem_mask)
++template <typename T, typename U> std::enable_if_t<std::is_convertible<U, T>::value, bool> alpha_device::store(u64 address, U data, T mem_mask)
+ {
+-	cpu_translate(address, device_memory_interface::TR_WRITE);
++	if (sizeof(T) > 2 && unaligned(address, sizeof(T), device_memory_interface::TR_WRITE))
++		return false;
++
++	if (!cpu_translate(address, device_memory_interface::TR_WRITE))
++		return false;
+ 
+ 	unsigned const s = (address >> 31) & 6;
+ 
+@@ -696,11 +975,14 @@ template <typename T, typename U> std::enable_if_t<std::is_convertible<U, T>::va
+ 	case 4: space(s).write_dword(address, T(data), mem_mask); break;
+ 	case 8: space(s).write_qword(address, T(data), mem_mask); break;
+ 	}
++
++	return true;
+ }
+ 
+ void alpha_device::fetch(u64 address, std::function<void(u32)> &&apply)
+ {
+-	cpu_translate(address, device_memory_interface::TR_FETCH);
++	if (!cpu_translate(address, device_memory_interface::TR_FETCH))
++		return;
+ 
+ 	apply(icache_fetch(address));
+ }
+@@ -734,6 +1016,64 @@ void alpha_ev4_device::device_reset()
+ 
+ 	m_abx[ABX_ABOX_CTL] = 0;
+ 	m_abx[ABX_BIU_CTL] = 0;
++
++	/*
++	 * Palcode takes its startup parameters from the registers the power-on
++	 * self test leaves behind, and only trusts them when a3 holds the 0xDECB
++	 * protocol signature.
++	 */
++	if (m_post_abox_ctl)
++	{
++		m_r[1] = m_post_abox_ctl;   // t0: abox_ctl
++		m_r[17] = m_post_memory_size; // a1: memory size
++		m_r[19] = 0xdecb0000;         // a3: signature and system revision
++	}
++
++	for (tb_entry &entry : m_itb)
++		entry.valid = false;
++	for (tb_entry &entry : m_dtb)
++		entry.valid = false;
++
++	m_itb_next = 0;
++	m_dtb_next = 0;
++	m_tb_tag = 0;
++}
++
++/*
++ * Hardware interrupt lines appear in hirr; the OSF PALcode masks them with hier
++ * according to the interrupt priority level it wants, so the hardware only has
++ * to dispatch when an enabled request is present.
++ */
++void alpha_ev4_device::execute_set_input(int inputnum, int state)
++{
++	if (inputnum < 3)
++	{
++		u64 const mask = 1ULL << (10 + inputnum);
++
++		if (state)
++			m_ibx[IBX_HIRR] |= mask;
++		else
++			m_ibx[IBX_HIRR] &= ~mask;
++	}
++}
++
++void alpha_ev4_device::interrupt_check()
++{
++	/*
++	 * The enable register is written in a different format from the one the
++	 * request register is read in: its bits 14 to 9 enable irq 5 down to 0,
++	 * which the request register reports one bit higher up.
++	 */
++	if (m_pal_mode || !(m_ibx[IBX_HIRR] & (m_ibx[IBX_HIER] << 1)))
++		return;
++
++	// an interrupt breaks the lock the same way a fault does
++	m_lock_flag = false;
++
++
++	m_ibx[IBX_EXC_ADDR] = m_pc;
++	m_pal_mode = true;
++	m_pc = m_ibx[IBX_PAL_BASE] | INTERRUPT;
+ }
+ 
+ void alpha_ev4_device::cpu_execute(u32 const op)
+@@ -743,6 +1083,9 @@ void alpha_ev4_device::cpu_execute(u32 const op)
+ 	case 0x00: // call_pal
+ 		{
+ 			u16 offset = CALL_PAL | ((op & 0x3f) << 6);
++
++
++
+ 			if (op & 0x80)
+ 			{
+ 				// unprivileged
+@@ -784,15 +1127,57 @@ void alpha_ev4_device::cpu_execute(u32 const op)
+ 		if (op & 0x80)
+ 			m_pt[Rc(op)] = m_r[Ra(op)];
+ 		break;
++	case 0x1b: // hw_ld
++		{
++			u64 address = m_r[Rb(op)] + (s64(s32((op & 0xfff) << 20)) >> 20);
++
++			if (!(op & 0x8000))
++			{
++				m_hw_access = true;
++				bool const ok = cpu_translate(address, device_memory_interface::TR_READ);
++				m_hw_access = false;
++
++				if (!ok)
++					break;
++			}
++
++			address_space &s = space((address >> 31) & 6);
++
++			if (op & 0x1000)
++				m_r[Ra(op)] = s.read_qword(address & ~u64(7));
++			else
++				m_r[Ra(op)] = s64(s32(s.read_dword(address & ~u64(3))));
++		}
++		break;
++
++	case 0x1f: // hw_st
++		{
++			u64 address = m_r[Rb(op)] + (s64(s32((op & 0xfff) << 20)) >> 20);
++
++			if (!(op & 0x8000))
++			{
++				m_hw_access = true;
++				bool const ok = cpu_translate(address, device_memory_interface::TR_WRITE);
++				m_hw_access = false;
++
++				if (!ok)
++					break;
++			}
++
++			address_space &s = space((address >> 31) & 6);
++
++			if (op & 0x1000)
++				s.write_qword(address & ~u64(7), m_r[Ra(op)]);
++			else
++				s.write_dword(address & ~u64(3), u32(m_r[Ra(op)]));
++		}
++		break;
++
+ 	case 0x1e: // hw_rei
+ 		m_pc = m_ibx[IBX_EXC_ADDR] & ~3;
+ 		m_pal_mode = BIT(m_ibx[IBX_EXC_ADDR], 0);
+ 
+-		if (m_lock_watch)
+-		{
+-			m_lock_watch->remove();
+-			m_lock_watch = nullptr;
+-		}
++		m_lock_flag = false;
+ 		break;
+ 
+ 	default:
+@@ -850,12 +1235,43 @@ void alpha_ev4_device::ibx_set(u8 reg, u64 data)
+ 		if (m_pal_mode)
+ 		{
+ 			m_ibx[reg] = data;
++
++			switch (reg)
++			{
++			case IBX_TB_TAG:
++				m_tb_tag = data;
++				break;
++
++			case IBX_ITB_PTE:
++				tb_load(m_itb, std::size(m_itb), m_itb_next, data);
++				break;
++
++			case IBX_ITBZAP:
++				for (tb_entry &entry : m_itb)
++					entry.valid = false;
++				m_itb_next = 0;
++				break;
++
++			case IBX_ITBASM:
++				for (tb_entry &entry : m_itb)
++					if (!BIT(entry.pte, 4))
++						entry.valid = false;
++				break;
++
++			case IBX_ITBIS:
++				for (tb_entry &entry : m_itb)
++					if ((entry.tag >> 13) == (data >> 13))
++						entry.valid = false;
++				break;
++			}
++
+ 			return;
+ 		}
+ 		break;
+ 
+ 	case IBX_EXC_ADDR:
+ 	case IBX_EXC_SUM:
++	case IBX_HIRR:
+ 	case IBX_SIRR:
+ 	case IBX_ASTRR:
+ 	case IBX_HIER:
+@@ -901,6 +1317,7 @@ u64 alpha_ev4_device::abx_get(u8 reg)
+ 	case ABX_VA:
+ 	case ABX_BIU_ADDR:
+ 	case ABX_BIU_STAT:
++	case ABX_DC_ADDR:
+ 	case ABX_DC_STAT:
+ 	case ABX_FILL_ADDR:
+ 		return m_abx[reg];
+@@ -915,11 +1332,35 @@ void alpha_ev4_device::abx_set(u8 reg, u64 data)
+ {
+ 	switch (abx_reg(reg))
+ 	{
+-	case ABX_TB_CTL:
+ 	case ABX_DTB_PTE:
++		tb_load(m_dtb, std::size(m_dtb), m_dtb_next, data);
++		m_abx[reg] = data;
++		return;
++
+ 	case ABX_DTBZAP:
+-	case ABX_DTBASM:
++		for (tb_entry &entry : m_dtb)
++			entry.valid = false;
++		m_dtb_next = 0;
++		m_abx[reg] = data;
++		return;
++
+ 	case ABX_DTBIS:
++		for (tb_entry &entry : m_dtb)
++			if ((entry.tag >> 13) == (data >> 13))
++				entry.valid = false;
++		m_abx[reg] = data;
++		return;
++
++	case ABX_DTBASM:
++		for (tb_entry &entry : m_dtb)
++			if (!BIT(entry.pte, 4))
++				entry.valid = false;
++		m_abx[reg] = data;
++		return;
++
++	case ABX_FLUSH_IC:
++	case ABX_FLUSH_IC_ASM:
++	case ABX_TB_CTL:
+ 	case ABX_ABOX_CTL:
+ 	case ABX_ALT_MODE:
+ 	case ABX_CC:
+@@ -927,8 +1368,6 @@ void alpha_ev4_device::abx_set(u8 reg, u64 data)
+ 	case ABX_BIU_CTL:
+ 	case ABX_FILL_SYNDROME:
+ 	case ABX_BC_TAG:
+-	case ABX_FLUSH_IC:
+-	case ABX_FLUSH_IC_ASM:
+ 		m_abx[reg] = data;
+ 		return;
+ 
+@@ -966,6 +1405,10 @@ void dec_21064_device::device_reset()
+ 	m_srom_oe_cb(1);
+ }
+ 
++// gcc 11.4 crashes compiling this one above -O1
++#if defined(__GNUC__) && !defined(__clang__)
++__attribute__((optimize("O1")))
++#endif
+ u32 dec_21064_device::icache_fetch(u64 const address)
+ {
+ 	icache_block &block = m_icache[(address >> 5) & 0xff];
+@@ -983,7 +1426,7 @@ u32 dec_21064_device::icache_fetch(u64 const address)
+ 
+ 		address_space &s = space((address >> 31) & 6);
+ 		for (unsigned i = 0; i < 8; i++)
+-			block.lw[i] = s.read_dword(address | (i << 2));
++			block.lw[i] = s.read_dword((address & ~u64(31)) | (i << 2));
+ 	}
+ 
+ 	return block.lw[(address >> 2) & 7];
+diff --git a/src/devices/cpu/alpha/alpha.h b/src/devices/cpu/alpha/alpha.h
+index 60d0a83c..231ea412 100644
+--- a/src/devices/cpu/alpha/alpha.h
++++ b/src/devices/cpu/alpha/alpha.h
+@@ -6,6 +6,8 @@
+ 
+ #pragma once
+ 
++#include <optional>
++
+ #include "alphad.h"
+ 
+ class alpha_device : public cpu_device
+@@ -13,6 +15,13 @@ class alpha_device : public cpu_device
+ public:
+ 	void set_dasm_type(alpha_disassembler::dasm_type type) { m_dasm_type = type; }
+ 
++	// values the power-on self test hands to palcode in registers
++	void set_post_params(u64 abox_ctl, u64 memory_size)
++	{
++		m_post_abox_ctl = abox_ctl;
++		m_post_memory_size = memory_size;
++	}
++
+ 	// input/output lines
+ 	auto srom_oe_w() { return m_srom_oe_cb.bind(); }
+ 	auto srom_data_r() { return m_srom_data_cb.bind(); }
+@@ -29,6 +38,7 @@ protected:
+ 	virtual u32 execute_max_cycles() const noexcept override { return 1; }
+ 	virtual void execute_run() override;
+ 	virtual void execute_set_input(int inputnum, int state) override;
++	virtual void interrupt_check() {}
+ 
+ 	// device_memory_interface overrides
+ 	virtual space_config_vector memory_space_config() const override;
+@@ -39,6 +49,7 @@ protected:
+ 
+ 	virtual void cpu_execute(u32 const op);
+ 	virtual bool cpu_translate(u64 &address, int intention) { return false; }
++	virtual bool unaligned(u64 address, unsigned bytes, int intention) { return false; }
+ 
+ 	// execution helpers
+ 	static u64 zap_mask(u8 const zap_bits);
+@@ -49,7 +60,7 @@ protected:
+ 	// memory access helpers
+ 	template <typename T, typename U> std::enable_if_t<std::is_convertible<U, std::function<void(T)>>::value, void> load(u64 address, U &&apply);
+ 	template <typename T, typename U> std::enable_if_t<std::is_convertible<U, std::function<void(address_space &, u64, T)>>::value, void> load_l(u64 address, U &&apply);
+-	template <typename T, typename U> std::enable_if_t<std::is_convertible<U, T>::value, void> store(u64 address, U data, T mem_mask = ~T(0));
++	template <typename T, typename U> std::enable_if_t<std::is_convertible<U, T>::value, bool> store(u64 address, U data, T mem_mask = ~T(0));
+ 	void fetch(u64 address, std::function<void(u32)> &&apply);
+ 
+ 	// cache helpers
+@@ -66,11 +77,18 @@ protected:
+ 	int m_icount;
+ 
+ 	u64 m_pc;
++	u64 m_pc_insn;
++	u32 m_insn;
+ 	u64 m_r[32];
+ 	u64 m_f[32];
++	u64 m_fpcr;
+ 
+ 	bool m_pal_mode;
+-	memory_passthrough_handler *m_lock_watch;
++	bool m_hw_access;
++	u64 m_post_abox_ctl = 0;
++	u64 m_post_memory_size = 0;
++	u64 m_lock_address;
++	bool m_lock_flag;
+ };
+ 
+ class alpha_ev4_device : public alpha_device
+@@ -85,6 +103,51 @@ protected:
+ 
+ 	virtual void cpu_execute(u32 const op) override;
+ 	virtual bool cpu_translate(u64 &address, int intention) override;
++	virtual bool unaligned(u64 address, unsigned bytes, int intention) override;
++
++	virtual void execute_set_input(int inputnum, int state) override;
++	virtual void interrupt_check() override;
++
++	void exception(u16 entry);
++
++	struct tb_entry
++	{
++		u64 tag;
++		u64 pte;
++		bool valid;
++	};
++
++	bool tb_translate(tb_entry *tb, unsigned count, u64 &address, int intention, u64 &fault);
++	void tb_load(tb_entry *tb, unsigned count, unsigned &next, u64 pte);
++
++	enum pte_mask : u64
++	{
++		PTE_V    = 0x0001, // valid
++		PTE_FOR  = 0x0002, // fault on read
++		PTE_FOW  = 0x0004, // fault on write
++		PTE_FOE  = 0x0008, // fault on execute
++		PTE_ASM  = 0x0010, // address space match
++		PTE_KRE  = 0x0100, // kernel read enable
++		PTE_URE  = 0x0200, // user read enable
++		PTE_KWE  = 0x1000, // kernel write enable
++		PTE_UWE  = 0x2000, // user write enable
++	};
++
++	enum mm_csr_mask : u64
++	{
++		MM_CSR_WR  = 0x0001, // reference was a write
++		MM_CSR_ACV = 0x0002, // access violation
++		MM_CSR_FOR = 0x0004, // fault on read
++		MM_CSR_FOW = 0x0008, // fault on write
++		MM_CSR_RA  = 0x01f0, // ra of faulting instruction
++		MM_CSR_OPC = 0x7e00, // opcode of faulting instruction
++	};
++
++	enum mm_csr_shift : unsigned
++	{
++		MM_CSR_V_RA  = 4,
++		MM_CSR_V_OPC = 9,
++	};
+ 
+ 	enum ibx_reg : unsigned
+ 	{
+@@ -186,6 +249,7 @@ protected:
+ 		ABX_DTBIS         = 8,  // w
+ 		ABX_BIU_ADDR      = 9,  // r
+ 		ABX_BIU_STAT      = 10, // r
++		ABX_DC_ADDR       = 11, // r
+ 		ABX_DC_STAT       = 12, // r
+ 		ABX_FILL_ADDR     = 13, // r
+ 		ABX_ABOX_CTL      = 14, // w
+@@ -244,6 +308,11 @@ protected:
+ 
+ 	u64 m_ibx[32];
+ 	u64 m_abx[32];
++	tb_entry m_itb[12];
++	tb_entry m_dtb[32];
++	unsigned m_itb_next;
++	unsigned m_dtb_next;
++	u64 m_tb_tag;
+ 	u64 m_pt[32];
+ };
+ 
