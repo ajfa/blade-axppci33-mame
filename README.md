@@ -149,9 +149,42 @@ and `osfpal.nh`, from the MILO sources the distribution installs in
 subset of the distribution itself.
 
 The subsets are floppy images holding an ext2 filesystem with one numbered piece
-of a tar file each. Concatenating the pieces in the order `Subset.list` gives and
-passing them through `gunzip | tar x` unpacks a subset, all of it from the host
-with `debugfs`, with nothing mounted and no privileges.
+of a tar file each, plus `Name`, `Description` and `Subset.list` on the first one.
+Concatenating the pieces in the order `Subset.list` gives and passing them through
+`gunzip | tar x` unpacks a subset, which then runs its own `doinst.sh`. All of it
+from the host with `debugfs -R "dump /01-of-11 out" b1`, nothing mounted and no
+privileges needed.
+
+The subsets are b, the base, on eleven floppies; d, gcc, on eight; e, emacs, on
+six; n, networking, on three; k, the kernel sources, on three; lsrc on two; x,
+X11, on twenty eight; and man, info, milo and cdi.
+
+## Building the disk
+
+The disk image is not here and cannot be: it is Digital's distribution. This is
+how the one behind the screenshots was made, from the media above, on the host,
+without booting the installer and without root.
+
+The tree is assembled under `fakeroot`, which is what makes `chown -R 0:0` and
+`sh MAKEDEV generic` work unprivileged, and the filesystem is built with the tree
+already in it:
+
+    mke2fs -F -q -b 1024 -I 128 -r 0 -O none -N 65536 -d root hda2.img
+
+Revision 0, 1024 byte blocks and 128 byte inodes are what the 1995 ext2 driver
+understands; anything newer is not read. Then `e2fsck -fy` and
+`tune2fs -c 20 -C 0`, because the 1994 `e2fsck` reads the maximum mount count as
+signed and leaves it at -1, which forces a full check on every boot.
+
+The MSDOS partition table is written by hand. The geometry that works is 1040
+cylinders, 16 heads and 63 sectors, 536,739,840 bytes, laid out as an 8 MB FAT16
+first partition, a 441 MB Linux second starting at LBA 16128, and swap third.
+**The root has to be partition 2**: that is where BLADE looks for it.
+
+Two things on the installed system are worth setting before it is used: `/etc/fstab`
+pointing at `/dev/hda2`, and `/etc/inittab` with gettys on tty1 to tty6.
+
+The loader then takes `boot hda2:vmlinux.gz root=/dev/hda2`.
 
 ## Running
 
